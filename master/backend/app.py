@@ -5,6 +5,7 @@ import json
 import os
 import re
 import secrets
+import hmac
 from pathlib import Path
 from urllib.parse import urlparse
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ import pymysql
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from flask import Flask, jsonify, request, session
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 app = Flask(__name__)
 app.config.update(
@@ -30,8 +32,14 @@ app.config.update(
 rooms: dict[str, dict[str, Any]] = {}
 rooms_lock = Lock()
 ROOMS_FILE = Path(os.environ.get("CHAT_ROOMS_FILE", Path(__file__).with_name("serverlist.json")))
+ROOM_HEARTBEAT_TIMEOUT = int(os.environ.get("CHAT_ROOM_HEARTBEAT_TIMEOUT", "90"))
+ROOM_REGISTRATION_SECRET = os.environ.get("CHAT_ROOM_REGISTRATION_SECRET", "")
+ROOM_TICKET_SECRET = os.environ.get("CHAT_ROOM_TICKET_SECRET", app.config["SECRET_KEY"])
+ROOM_TICKET_MAX_AGE = int(os.environ.get("CHAT_ROOM_TICKET_MAX_AGE", "120"))
+ticket_serializer = URLSafeTimedSerializer(ROOM_TICKET_SECRET, salt="communism-network-room-ticket-v1")
 password_hasher = PasswordHasher()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,32}$")
+THEMES = {"paper", "midnight", "red"}
 
 
 def utc_now() -> str:
@@ -121,6 +129,47 @@ def clean_registration_payload(payload: dict[str, Any]):
     return {"username": username, "password": password}, None
 
 
+def clean_profile_payload(payload: dict[str, Any]):
+    display_name = str(payload.get("display_name") or "").strip()
+    description = str(payload.get("description") or "").strip()
+    website_theme = str(payload.get("website_theme") or "paper").strip().lower()
+    profile_theme = str(payload.get("profile_theme") or "paper").strip().lower()
+    pronouns = payload.get("pronouns", [])
+    if not isinstance(pronouns, list):
+        return None, "pronouns must be a list"
+    cleaned_pronouns = []
+    for pronoun in pronouns[:10]:
+        value = str(pronoun).strip()
+        if not value or len(value) > 6:
+            return None, "each pronoun must be 1-6 characters"
+        cleaned_pronouns.append(value)
+    if len(display_name) > 20:
+        return None, "name must be 20 characters or fewer"
+    if len(description) > 200:
+        return None, "description must be 200 characters or fewer"
+    if website_theme not in THEMES or profile_theme not in THEMES:
+        return None, "invalid theme"
+    return {"display_name": display_name, "description": description, "pronouns": cleaned_pronouns, "website_theme": website_theme, "profile_theme": profile_theme}, None
+
+
+def profile_from_row(user: dict[str, Any]) -> dict[str, Any]:
+    try:
+        pronouns = json.loads(user.get("pronouns") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        pronouns = []
+    if not isinstance(pronouns, list):
+        pronouns = []
+    return {
+        "id": int(user["id"]),
+        "username": user["username"],
+        "display_name": user.get("display_name") or "",
+        "description": user.get("description") or "",
+        "pronouns": [str(value) for value in pronouns],
+        "website_theme": user.get("website_theme") or "paper",
+        "profile_theme": user.get("profile_theme") or "paper",
+    }
+
+
 def clean_server_payload(payload: dict[str, Any]):
     raw_address = str(payload.get("ip_address") or payload.get("address") or "").strip()
     parsed_endpoint = room_endpoint(raw_address) if "://" in raw_address else None
@@ -163,17 +212,62 @@ def login_required(view):
 def clean_room_payload(payload: dict[str, Any]):
     room_name = str(payload.get("room_name") or payload.get("name") or "").strip()
     server_address = str(payload.get("server_address") or payload.get("server_url") or payload.get("url") or "").strip()
+    ws_address = str(payload.get("ws_address") or "").strip()
+    room_id = str(payload.get("room_id") or "").strip()
+    protocol_version = str(payload.get("protocol_version") or "1").strip()
+    raw_channels = payload.get("channels")
+    channels = []
+    if isinstance(raw_channels, list):
+        for value in raw_channels[:50]:
+            if not isinstance(value, dict):
+                continue
+            channel_id = str(value.get("id") or "").strip().lower()
+            channel_name = str(value.get("name") or "").strip()
+            if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", channel_id) and channel_name and len(channel_name) <= 64:
+                channels.append({"id": channel_id, "name": channel_name})
     if not room_name:
         return None, "missing room_name"
     if not server_address:
         return None, "missing server_address"
-    room_id = sha256(f"{room_name}\0{server_address}".encode()).hexdigest()[:16]
-    return {"room_id": room_id, "room_name": room_name, "server_address": server_address, "last_seen": utc_now()}, None
+    if not room_id:
+        room_id = sha256(f"{room_name}\0{server_address}".encode()).hexdigest()[:16]
+    parsed = room_endpoint(ws_address or server_address)
+    if parsed is None:
+        return None, "server_address must be a valid http(s) or ws(s) URL"
+    return {
+        "room_id": room_id,
+        "room_name": room_name,
+        "server_address": server_address,
+        "ws_address": ws_address or server_address.replace("https://", "wss://").replace("http://", "ws://"),
+        "protocol_version": protocol_version,
+        "channels": channels or [{"id": "general", "name": "General"}],
+        "images_enabled": bool(payload.get("images_enabled", True)),
+        "last_heartbeat": utc_now(),
+        "status": "online",
+    }, None
+
+
+def room_is_online(room: dict[str, Any]) -> bool:
+    try:
+        last_heartbeat = datetime.fromisoformat(str(room.get("last_heartbeat") or room.get("last_seen")))
+        if last_heartbeat.tzinfo is None:
+            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - last_heartbeat).total_seconds() <= ROOM_HEARTBEAT_TIMEOUT
+    except (TypeError, ValueError):
+        return False
+
+
+def require_room_server_auth() -> bool:
+    if not ROOM_REGISTRATION_SECRET:
+        return True
+    provided = request.headers.get("Authorization", "")
+    expected = f"Bearer {ROOM_REGISTRATION_SECRET}"
+    return hmac.compare_digest(provided, expected)
 
 
 def room_endpoint(address: str) -> tuple[str, int] | None:
     parsed = urlparse(address if "://" in address else f"https://{address}")
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.hostname:
         return None
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -192,7 +286,8 @@ def sync_room_server(room: dict[str, Any]) -> int | None:
             cursor.execute(
                 """INSERT INTO servers (ip_address, port, name, server_address, room_id)
                    VALUES (%s, %s, %s, %s, %s)
-                   ON DUPLICATE KEY UPDATE name = VALUES(name), server_address = VALUES(server_address)""",
+                   ON DUPLICATE KEY UPDATE ip_address = VALUES(ip_address), port = VALUES(port),
+                       name = VALUES(name), server_address = VALUES(server_address)""",
                 (host, port, room["room_name"], room["server_address"], room["room_id"]),
             )
             cursor.execute("SELECT id FROM servers WHERE room_id = %s", (room["room_id"],))
@@ -217,7 +312,7 @@ def register():
         return error(message, 400)
     try:
         with db_connection() as connection, connection.cursor() as cursor:
-            cursor.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", (clean["username"], password_hasher.hash(clean["password"])))
+            cursor.execute("INSERT INTO users (username, password_hash, display_name, description, pronouns, website_theme, profile_theme) VALUES (%s, %s, %s, %s, %s, %s, %s)", (clean["username"], password_hasher.hash(clean["password"]), "", "", "[]", "paper", "paper"))
             user_id = cursor.lastrowid
     except pymysql.err.IntegrityError as exc:
         if exc.args and exc.args[0] == 1062:
@@ -275,6 +370,42 @@ def me():
     return jsonify({"ok": True, "user": user, "csrf_token": session.get("csrf_token")})
 
 
+@app.get("/auth/profile")
+@login_required
+def profile():
+    try:
+        with db_connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id, username, display_name, description, pronouns, website_theme, profile_theme FROM users WHERE id = %s", (current_user_id(),))
+            user = cursor.fetchone()
+    except pymysql.MySQLError:
+        return error("database unavailable")
+    if not user:
+        return error("user not found", 404)
+    return jsonify({"ok": True, "profile": profile_from_row(user), "csrf_token": session.get("csrf_token")})
+
+
+@app.put("/auth/profile")
+@login_required
+def update_profile():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error("expected json object", 400)
+    clean, message = clean_profile_payload(payload)
+    if message:
+        return error(message, 400)
+    try:
+        with db_connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE users SET display_name = %s, description = %s, pronouns = %s, website_theme = %s, profile_theme = %s WHERE id = %s",
+                (clean["display_name"], clean["description"], json.dumps(clean["pronouns"], ensure_ascii=False, separators=(",", ":")), clean["website_theme"], clean["profile_theme"], current_user_id()),
+            )
+            cursor.execute("SELECT id, username, display_name, description, pronouns, website_theme, profile_theme FROM users WHERE id = %s", (current_user_id(),))
+            user = cursor.fetchone()
+    except pymysql.MySQLError:
+        return error("database unavailable")
+    return jsonify({"ok": True, "profile": profile_from_row(user)})
+
+
 @app.post("/servers")
 @login_required
 def register_server():
@@ -322,7 +453,7 @@ def join_server(server_id: int):
 def list_servers():
     try:
         with db_connection() as connection, connection.cursor() as cursor:
-            cursor.execute("""SELECT s.id, s.ip_address, s.port, s.name, s.server_address, us.joined_at
+            cursor.execute("""SELECT s.id, s.room_id, s.ip_address, s.port, s.name, s.server_address, us.joined_at
                               FROM user_servers AS us
                               INNER JOIN servers AS s ON s.id = us.server_id
                               WHERE us.user_id = %s ORDER BY us.joined_at DESC""", (current_user_id(),))
@@ -336,7 +467,7 @@ def list_servers():
 def discover_servers():
     user_id = current_user_id()
     with rooms_lock:
-        discovered = [dict(room) for room in rooms.values()]
+        discovered = [dict(room) for room in rooms.values() if room_is_online(room)]
     joined_ids: set[int] = set()
     if user_id is not None:
         try:
@@ -351,6 +482,48 @@ def discover_servers():
         except pymysql.MySQLError:
             return error("database unavailable")
     return jsonify({"ok": True, "rooms": sorted(discovered, key=lambda room: room["room_name"].lower())})
+
+
+@app.get("/rooms/<room_id>/connection")
+@login_required
+def room_connection(room_id: str):
+    with rooms_lock:
+        room = dict(rooms.get(room_id) or {})
+    if not room:
+        return error("room not found", 404)
+    if not room_is_online(room):
+        return error("room server is offline", 503)
+    try:
+        with db_connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT u.id, u.username, s.id AS server_id
+                   FROM users AS u
+                   INNER JOIN user_servers AS us ON us.user_id = u.id
+                   INNER JOIN servers AS s ON s.id = us.server_id
+                   WHERE u.id = %s AND s.room_id = %s""",
+                (current_user_id(), room_id),
+            )
+            membership = cursor.fetchone()
+    except pymysql.MySQLError:
+        return error("database unavailable")
+    if not membership:
+        return error("room membership required", 403)
+    ticket = ticket_serializer.dumps({
+        "aud": "room-server",
+        "room_id": room_id,
+        "user_id": int(membership["id"]),
+        "username": membership["username"],
+        "server_id": int(membership["server_id"]),
+    })
+    return jsonify({
+        "ok": True,
+        "room_id": room_id,
+        "room_name": room["room_name"],
+        "ws_address": room["ws_address"],
+        "protocol_version": room.get("protocol_version", "1"),
+        "connection_ticket": ticket,
+        "expires_in": ROOM_TICKET_MAX_AGE,
+    })
 
 
 @app.post("/servers/join")
@@ -392,8 +565,11 @@ def leave_server(server_id: int):
     return jsonify({"ok": True})
 
 
+@app.post("/api/rooms/register")
 @app.post("/routing/rooms")
-def receive_room_server_message():
+def register_room_server():
+    if not require_room_server_auth():
+        return error("room server authentication failed", 401)
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return error("expected json object", 400)
@@ -412,6 +588,67 @@ def receive_room_server_message():
             rooms[room["room_id"]]["server_id"] = server_id
             save_rooms()
     return jsonify({"ok": True, "created": not already_known, "room": room}), 201 if not already_known else 200
+
+
+@app.post("/api/rooms/heartbeat")
+@app.post("/routing/rooms/<room_id>/heartbeat")
+def room_heartbeat(room_id: str | None = None):
+    if not require_room_server_auth():
+        return error("room server authentication failed", 401)
+    payload = request.get_json(silent=True) or {}
+    room_id = room_id or str(payload.get("room_id") or "").strip()
+    if not room_id:
+        return error("missing room_id", 400)
+    with rooms_lock:
+        room = rooms.get(room_id)
+        if room is None:
+            return error("room not found", 404)
+        room["last_heartbeat"] = utc_now()
+        room["status"] = "online"
+        save_rooms()
+    return jsonify({"ok": True, "room_id": room_id, "status": "online", "last_heartbeat": room["last_heartbeat"]})
+
+
+@app.post("/api/rooms/<room_id>/events")
+def room_event(room_id: str):
+    if not require_room_server_auth():
+        return error("room server authentication failed", 401)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return error("expected json object", 400)
+    if payload.get("event") not in {"status", "occupancy", "sync_metadata"}:
+        return error("unsupported room event", 400)
+    with rooms_lock:
+        room = rooms.get(room_id)
+        if room is None:
+            return error("room not found", 404)
+        room["last_heartbeat"] = utc_now()
+        room["status"] = "online"
+        if "occupancy" in payload:
+            try:
+                room["occupancy"] = max(0, int(payload["occupancy"]))
+            except (TypeError, ValueError):
+                return error("occupancy must be an integer", 400)
+        save_rooms()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/rooms/<room_id>/profiles/<int:user_id>")
+def room_profile(room_id: str, user_id: int):
+    if not require_room_server_auth():
+        return error("room server authentication failed", 401)
+    with rooms_lock:
+        if room_id not in rooms:
+            return error("room not found", 404)
+    try:
+        with db_connection() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT id, username, display_name, description, pronouns, website_theme, profile_theme FROM users WHERE id = %s", (user_id,))
+            user = cursor.fetchone()
+    except pymysql.MySQLError:
+        return error("database unavailable")
+    if not user:
+        return error("profile not found", 404)
+    return jsonify({"ok": True, "profile": profile_from_row(user)})
 
 
 @app.get("/routing/rooms")
@@ -436,10 +673,13 @@ app.add_url_rule("/api/auth/signup", endpoint="api_signup", view_func=register, 
 app.add_url_rule("/api/auth/login", endpoint="api_login", view_func=login, methods=["POST"])
 app.add_url_rule("/api/auth/logout", endpoint="api_logout", view_func=logout, methods=["POST"])
 app.add_url_rule("/api/auth/me", endpoint="api_me", view_func=me, methods=["GET"])
+app.add_url_rule("/api/auth/profile", endpoint="api_profile", view_func=profile, methods=["GET"])
+app.add_url_rule("/api/auth/profile", endpoint="api_update_profile", view_func=update_profile, methods=["PUT"])
 app.add_url_rule("/api/servers/joined", endpoint="api_joined", view_func=list_servers, methods=["GET"])
 app.add_url_rule("/api/servers/discover", endpoint="api_discover", view_func=discover_servers, methods=["GET"])
 app.add_url_rule("/api/servers/join", endpoint="api_join", view_func=join_discovered_server, methods=["POST"])
 app.add_url_rule("/api/servers/<int:server_id>/join", endpoint="api_leave", view_func=leave_server, methods=["DELETE"])
+app.add_url_rule("/api/rooms/<room_id>/connection", endpoint="api_room_connection", view_func=room_connection, methods=["GET"])
 
 
 load_rooms()

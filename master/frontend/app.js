@@ -1,5 +1,18 @@
-const API_BASE = window.NETWORK_API_BASE || "../backend/api";
+const API_BASE = window.NETWORK_API_BASE || "/api";
 let csrfToken = "";
+
+function applyWebsiteTheme(theme) {
+  const selected = ["paper", "midnight", "red"].includes(theme) ? theme : "paper";
+  document.documentElement.dataset.theme = selected;
+  try { localStorage.setItem("cn-website-theme", selected); } catch {}
+}
+
+async function loadWebsiteTheme() {
+  try {
+    const data = await api("/auth/profile");
+    applyWebsiteTheme(data.profile.website_theme);
+  } catch {}
+}
 
 async function api(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
@@ -89,7 +102,7 @@ async function loadJoinedRooms() {
       container.innerHTML = '<div class="empty">You have not joined a room yet. Visit Discover to find one.</div>';
       return;
     }
-    data.servers.forEach((server) => container.appendChild(roomCard({ room_id: server.id, room_name: server.name || "Joined room", server_address: server.server_address || `${server.ip_address}:${server.port}` }, "open")));
+    data.servers.forEach((server) => container.appendChild(roomCard({ room_id: server.room_id || server.id, room_name: server.name || "Joined room", server_address: server.server_address || `${server.ip_address}:${server.port}` }, "open")));
   } catch (error) {
     container.innerHTML = `<div class="empty">${error.message}</div>`;
   }
@@ -111,10 +124,77 @@ async function loadDiscoverRooms() {
   }
 }
 
-async function bindLogout() {
+async function bindAuthAction() {
   const button = document.querySelector("[data-logout]");
   if (!button) return;
-  button.addEventListener("click", async () => { await api("/auth/logout", { method: "POST" }); window.location.href = "login.html"; });
+  try {
+    await api("/auth/me");
+    button.textContent = "Log out";
+    button.addEventListener("click", async () => {
+      await api("/auth/logout", { method: "POST" });
+      window.location.href = "login.html";
+    });
+  } catch {
+    button.textContent = "Sign in";
+    button.addEventListener("click", () => { window.location.href = "login.html"; });
+  }
+}
+
+async function bindProfileForm() {
+  const form = document.querySelector("[data-profile-form]");
+  if (!form) return;
+  const name = form.elements.display_name;
+  const description = form.elements.description;
+  const pronouns = form.elements.pronouns;
+  const websiteTheme = form.elements.website_theme;
+  const profileTheme = form.elements.profile_theme;
+  const previewName = document.querySelector("[data-preview-name]");
+  const previewDescription = document.querySelector("[data-preview-description]");
+  const previewPronouns = document.querySelector("[data-preview-pronouns]");
+  const previewAvatar = document.querySelector("[data-preview-avatar]");
+  const previewCard = document.querySelector("[data-profile-preview-card]");
+  const updatePreview = () => {
+    const previewText = name.value.trim() || "Your name";
+    previewName.textContent = previewText;
+    previewDescription.textContent = description.value.trim() || "Your description will appear here.";
+    previewPronouns.textContent = pronouns.value.split(",").map(value => value.trim()).filter(Boolean).join(" · ");
+    previewAvatar.textContent = previewText.slice(0, 1).toUpperCase();
+    previewCard.dataset.theme = profileTheme.value;
+  };
+  [name, description, pronouns].forEach(field => {
+    field.addEventListener("input", updatePreview);
+    field.addEventListener("change", updatePreview);
+  });
+  updatePreview();
+  try {
+    const data = await api("/auth/profile");
+    name.value = data.profile.display_name || "";
+    description.value = data.profile.description || "";
+    pronouns.value = (data.profile.pronouns || []).join(", ");
+    websiteTheme.value = data.profile.website_theme || "paper";
+    profileTheme.value = data.profile.profile_theme || "paper";
+    applyWebsiteTheme(websiteTheme.value);
+    updatePreview();
+  } catch (error) {
+    showError(form, error.message);
+    return;
+  }
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    form.querySelector(".form-error").hidden = true;
+    const button = form.querySelector("button[type=submit]");
+    button.disabled = true;
+    try {
+      const values = pronouns.value.split(",").map(value => value.trim()).filter(Boolean);
+      await api("/auth/profile", { method: "PUT", body: JSON.stringify({ display_name: name.value, description: description.value, pronouns: values, website_theme: websiteTheme.value, profile_theme: profileTheme.value }) });
+      applyWebsiteTheme(websiteTheme.value);
+      showToast("Profile saved.");
+    } catch (error) {
+      showError(form, error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
 }
 
 function showToast(message) {
@@ -126,7 +206,8 @@ function showToast(message) {
 }
 
 bindAuthForm();
-bindLogout();
-api("/auth/me").catch(() => {});
+bindAuthAction();
+bindProfileForm();
+loadWebsiteTheme();
 loadJoinedRooms();
 loadDiscoverRooms();
